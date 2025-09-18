@@ -1,0 +1,143 @@
+# Install dependencies (run first)
+!pip install langgraph pyautogen autogen pinecone sentence-transformers openai-whisper transformers torch
+
+import os
+import whisper
+from langgraph.graph import StateGraph, END
+from typing import Dict, Any
+from sentence_transformers import SentenceTransformer
+from pinecone import Pinecone, ServerlessSpec
+from autogen import AssistantAgent, UserProxyAgent
+import requests
+import json
+from google.colab import files
+from transformers import pipeline
+
+# Step 1: Set up environment variables
+os.environ["PINECONE_API_KEY"] = "api key"  # From Pinecone console
+os.environ["HUGGINGFACE_API_KEY"] = "api key"  
+PINECONE_INDEX_NAME = "podcast-summaries"
+PINECONE_ENVIRONMENT = "as per yours"  # Update if different (from your index host)
+
+# Step 2: Initialize models and Pinecone
+embedder = SentenceTransformer("all-MiniLM-L6-v2")
+pinecone = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+
+# Create Pinecone index (fixed for serverless AWS)
+if PINECONE_INDEX_NAME not in pinecone.list_indexes().names():
+    pinecone.create_index(
+        name=PINECONE_INDEX_NAME,
+        dimension=384,  # Matches all-MiniLM-L6-v2
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region="us-east-1")
+    )
+index = pinecone.Index(PINECONE_INDEX_NAME)
+
+# Step 3: Define LangGraph state
+class GraphState(Dict[str, Any]):
+    audio_path: str
+    transcript: str
+    summary: str
+    question: str
+    answer: str
+    context: str = "" # Add context to the state
+
+# Step 4: Patched function with local Whisper and fallback summarization
+def call_huggingface(prompt: str = None, audio_path: str = None, task: str = "text-generation"):
+    if task == "transcription":
+        # Local Whisper (no API, avoids 403)
+        try:
+            model = whisper.load_model("tiny")  # Small, fast model
+            result = model.transcribe(audio_path)
+            return result["text"]
+        except Exception as e:
+            print(f"Local Whisper error: {e}. Check audio file.")
+            return ""
+    else:  # Summarization or generation
+        if not prompt:
+            return ""
+        headers = {"Authorization": f"Bearer {os.environ.get('HUGGINGFACE_API_KEY', '')}"}
+        response = requests.post(
+            "https://api-inference.huggingface.co/models/mixtral-8x7b-instruct-v0.1",
+            headers=headers,
+            json={"inputs": prompt}
+        )
+        if response.status_code == 200 and response.text.strip():
+            try:
+                return response.json()[0]["generated_text"]
+            except Exception as e:
+                print(f"JSON parse failed for generation: {e}. Falling back to local summarization.")
+                summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+                return summarizer(prompt, max_length=100, min_length=30, do_sample=False)[0]["summary_text"]
+        else:
+            print(f"API error {response.status_code}: {response.text[:100]}. Using local summarization fallback.")
+            summarizer = pipeline("summarization", model="facebook/bart-large-cnn")
+            return summarizer(prompt, max_length=100, min_length=30, do_sample=False)[0]["summary_text"]
+
+# Step 5: LangGraph nodes with checks for required state variables
+def transcribe_audio(state: GraphState) -> GraphState:
+    state["transcript"] = call_huggingface(audio_path=state["audio_path"], task="transcription")
+    return state
+
+def summarize_transcript(state: GraphState) -> GraphState:
+    if not state.get("transcript"):
+        print("Transcript is empty, skipping summarization.")
+        return state
+    prompt = f"Summarize this podcast transcript in 2-3 sentences: {state['transcript']}"
+    state["summary"] = call_huggingface(prompt=prompt)
+    return state
+
+def store_in_pinecone(state: GraphState) -> GraphState:
+    if not state.get("summary"):
+        print("Summary is empty, skipping Pinecone storage.")
+        return state
+    embedding = embedder.encode(state["summary"]).tolist()
+    index.upsert(vectors=[(f"summary_{id(state)}", embedding, {"text": state["summary"]})])
+    return state
+
+def query_pinecone(state: GraphState) -> GraphState:
+    if not state.get("question"):
+        print("Question is empty, skipping Pinecone query.")
+        return state
+    query_embedding = embedder.encode(state["question"]).tolist()
+    results = index.query(vector=query_embedding, top_k=1, include_metadata=True)
+    state["context"] = results["matches"][0]["metadata"]["text"] if results["matches"] else ""
+    return state
+
+def answer_question(state: GraphState) -> GraphState:
+    if not state.get("context"):
+        print("Context is empty, cannot answer the question.")
+        state["answer"] = "Could not retrieve relevant information to answer the question."
+        return state
+
+    prompt = f"Context: {state['context']}\nQuestion: {state['question']}\nAnswer concisely."
+    state["answer"] = call_huggingface(prompt=prompt)
+    return state
+
+# Step 6: Build LangGraph workflow
+workflow = StateGraph(GraphState)
+workflow.add_node("transcribe", transcribe_audio)
+workflow.add_node("summarize", summarize_transcript)
+workflow.add_node("store", store_in_pinecone)
+workflow.add_node("query", query_pinecone)
+workflow.add_node("answer", answer_question)
+
+workflow.add_edge("transcribe", "summarize")
+workflow.add_edge("summarize", "store")
+workflow.add_edge("store", "query")
+workflow.add_edge("query", "answer")
+workflow.add_edge("answer", END)
+
+workflow.set_entry_point("transcribe")
+graph = workflow.compile()
+
+# Step 7: Run the workflow
+uploaded = files.upload()
+audio_path = list(uploaded.keys())[0]  # e.g., 'sunsetgun_01_parker_64kb.mp3'
+question = "What is the main topic of the podcast?"
+state = GraphState(audio_path=audio_path, question=question)
+result = graph.invoke(state)
+print("Transcript:", result["transcript"])
+print("Summary:", result["summary"])
+print("Question:", question)
+print("Answer:", result["answer"])
